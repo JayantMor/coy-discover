@@ -1,7 +1,5 @@
 
-import { readFile, writeFile } from "fs/promises";
-import path from "path";
-
+import { createClient } from "@supabase/supabase-js";
 import { profiles, type Profile } from "../data/profile";
 
 type Swipe = {
@@ -9,37 +7,21 @@ type Swipe = {
   action: "like" | "pass";
 };
 
-type Database = {
-  swipes: Swipe[];
-  matches: number[];
-};
+type PublicProfile = Omit<Profile, "likedYou">;
 
-export type PublicProfile = Omit<Profile, "likedYou">;
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseSecretKey = process.env.SUPABASE_SECRET_KEY;
 
-const databasePath = path.join(process.cwd(), "data", "db.json");
-
-async function readDatabase(): Promise<Database> {
-  try {
-    const content = await readFile(databasePath, "utf-8");
-    return JSON.parse(content) as Database;
-  } catch {
-    const initialDatabase: Database = {
-      swipes: [],
-      matches: [],
-    };
-
-    await writeDatabase(initialDatabase);
-    return initialDatabase;
-  }
+if (!supabaseUrl || !supabaseSecretKey) {
+  throw new Error("Supabase environment variables are missing.");
 }
 
-async function writeDatabase(database: Database): Promise<void> {
-  await writeFile(
-    databasePath,
-    JSON.stringify(database, null, 2),
-    "utf-8"
-  );
-}
+const supabase = createClient(supabaseUrl, supabaseSecretKey, {
+  auth: {
+    autoRefreshToken: false,
+    persistSession: false,
+  },
+});
 
 function getPublicProfile(profile: Profile): PublicProfile {
   const { likedYou, ...publicProfile } = profile;
@@ -47,10 +29,14 @@ function getPublicProfile(profile: Profile): PublicProfile {
 }
 
 export async function getFeed(): Promise<PublicProfile[]> {
-  const database = await readDatabase();
+  const { data, error } = await supabase
+    .from("swipes")
+    .select("profile_id");
+
+  if (error) throw error;
 
   const swipedIds = new Set(
-    database.swipes.map((swipe) => swipe.profileId)
+    (data ?? []).map((swipe) => swipe.profile_id)
   );
 
   return profiles
@@ -62,31 +48,42 @@ export async function recordSwipe(
   profileId: number,
   action: "like" | "pass"
 ) {
-  const database = await readDatabase();
-
   const profile = profiles.find((item) => item.id === profileId);
 
   if (!profile) {
     return { success: false, message: "Profile not found." };
   }
 
-  const alreadySwiped = database.swipes.some(
-    (swipe) => swipe.profileId === profileId
-  );
+  const { data: existingSwipe, error: checkError } = await supabase
+    .from("swipes")
+    .select("profile_id")
+    .eq("profile_id", profileId)
+    .maybeSingle();
 
-  if (alreadySwiped) {
+  if (checkError) throw checkError;
+
+  if (existingSwipe) {
     return { success: false, message: "Profile already swiped." };
   }
 
-  database.swipes.push({ profileId, action });
+  const { error: swipeError } = await supabase
+    .from("swipes")
+    .insert({
+      profile_id: profileId,
+      action,
+    });
+
+  if (swipeError) throw swipeError;
 
   const isMatch = action === "like" && profile.likedYou === true;
 
   if (isMatch) {
-    database.matches.push(profileId);
-  }
+    const { error: matchError } = await supabase
+      .from("matches")
+      .insert({ profile_id: profileId });
 
-  await writeDatabase(database);
+    if (matchError) throw matchError;
+  }
 
   return {
     success: true,
@@ -96,10 +93,17 @@ export async function recordSwipe(
 }
 
 export async function getMatches(): Promise<PublicProfile[]> {
-  const database = await readDatabase();
+  const { data, error } = await supabase
+    .from("matches")
+    .select("profile_id");
 
-  return database.matches
-    .map((id) => profiles.find((profile) => profile.id === id))
-    .filter((profile): profile is Profile => profile !== undefined)
+  if (error) throw error;
+
+  const matchedIds = new Set(
+    (data ?? []).map((match) => match.profile_id)
+  );
+
+  return profiles
+    .filter((profile) => matchedIds.has(profile.id))
     .map(getPublicProfile);
 }
